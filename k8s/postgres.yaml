@@ -1,0 +1,69 @@
+# Persistent storage for Postgres's data directory. A Pod is disposable
+# (Kubernetes can kill and recreate it any time), but this claim -- and the
+# disk space behind it -- survives that, the same role compose.yaml's
+# "postgres-data" volume played.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+spec:
+  replicas: 1 # a single database writer; more replicas would fight over the same disk
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: agent-relay-secrets
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+              subPath: pgdata # avoid postgres complaining about a non-empty mount root
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "agent_relay", "-d", "agent_relay"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "agent_relay", "-d", "agent_relay"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
+---
+# A Service is a stable name/address for a moving target: Pods get replaced
+# and get new IPs, but "postgres" always resolves to whichever Pod is
+# currently healthy. This is what the app connects to, not a Pod directly.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

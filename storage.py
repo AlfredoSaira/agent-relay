@@ -26,6 +26,7 @@ from database import (
     LEASE_SECONDS,
     MAX_ATTEMPTS,
     Task,
+    USE_ROW_LOCKS,
     as_db_time,
     db_session,
     db_time,
@@ -78,7 +79,10 @@ def authenticate(token: str) -> Agent:
     # the same writer boundary as task operations so concurrent workers do not
     # hold stale WAL snapshots while trying to update it.
     with immediate_transaction() as db:
-        agent = db.scalar(select(Agent).where(Agent.token_hash == token_digest))
+        query = select(Agent).where(Agent.token_hash == token_digest)
+        if USE_ROW_LOCKS:
+            query = query.with_for_update()
+        agent = db.scalar(query)
         if agent is None or not hmac.compare_digest(agent.token_hash, token_digest):
             raise RelayError("invalid_credentials", "The agent token is invalid.", 401)
         agent.last_seen_at = as_db_time(utcnow())
@@ -144,12 +148,17 @@ def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
     with immediate_transaction() as db:
         now = utcnow()
         recover_expired_in_session(db, now)
-        task = db.scalar(
+        query = (
             select(Task)
             .where(Task.recipient_id == agent_id, Task.status == "queued")
             .order_by(Task.created_at, Task.id)
             .limit(1)
         )
+        if USE_ROW_LOCKS:
+            # skip_locked: another worker already racing for the oldest
+            # queued task should fall through to the next one, not wait.
+            query = query.with_for_update(skip_locked=True)
+        task = db.scalar(query)
         if task is None:
             return None
         if task.attempt_count >= MAX_ATTEMPTS:
@@ -188,14 +197,15 @@ def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
 
 
 def _find_attempt_for_token(db: Session, task_id: str, token: str) -> Attempt | None:
-    return db.scalar(
-        select(Attempt).where(Attempt.task_id == task_id, Attempt.claim_token_hash == secret_hash(token))
-    )
+    query = select(Attempt).where(Attempt.task_id == task_id, Attempt.claim_token_hash == secret_hash(token))
+    if USE_ROW_LOCKS:
+        query = query.with_for_update()
+    return db.scalar(query)
 
 
 def heartbeat(task_id: str, agent_id: str, claim_token: str) -> str:
     with immediate_transaction() as db:
-        task = db.get(Task, task_id)
+        task = db.get(Task, task_id, with_for_update=USE_ROW_LOCKS or None)
         if task is None or task.recipient_id != agent_id:
             raise RelayError("not_found", "Task not found.", 404)
         attempt = _find_attempt_for_token(db, task_id, claim_token)
@@ -222,7 +232,7 @@ def commit_terminal(
     value: str,
 ) -> dict[str, str]:
     with immediate_transaction() as db:
-        task = db.get(Task, task_id)
+        task = db.get(Task, task_id, with_for_update=USE_ROW_LOCKS or None)
         if task is None or task.recipient_id != agent_id:
             raise RelayError("not_found", "Task not found.", 404)
         attempt = _find_attempt_for_token(db, task_id, claim_token)

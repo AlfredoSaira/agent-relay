@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agent_relay
+      POSTGRES_PASSWORD: agent_relay
+      POSTGRES_DB: agent_relay
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_relay -d agent_relay"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+
+  agent-relay:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Hostname "postgres" resolves via Compose's internal network, not
+      # "localhost" -- the two containers are separate machines to each other.
+      RELAY_DATABASE_URL: postgresql+psycopg://agent_relay:agent_relay@postgres:5432/agent_relay
+    ports:
+      - "8000:8000"
+
+volumes:
+  postgres-data:

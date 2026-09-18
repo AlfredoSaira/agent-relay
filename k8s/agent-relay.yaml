@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-relay
+spec:
+  replicas: 2 # the API has no local state, so more than one copy can share the load
+  selector:
+    matchLabels:
+      app: agent-relay
+  template:
+    metadata:
+      labels:
+        app: agent-relay
+    spec:
+      # The app connects to Postgres as soon as it's imported (see
+      # database.py's init_db()). Without waiting here, a Pod that starts
+      # before Postgres is accepting connections would crash and Kubernetes
+      # would keep restarting it in a loop.
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          envFrom:
+            - secretRef:
+                name: agent-relay-secrets
+          command:
+            - sh
+            - -c
+            - until pg_isready -h postgres -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB"; do echo waiting for postgres; sleep 2; done
+      containers:
+        - name: agent-relay
+          image: agent-relay:local
+          imagePullPolicy: IfNotPresent # this image only exists inside the cluster (loaded via "kind load"), never pull it from a registry
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: agent-relay-secrets
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-relay
+spec:
+  selector:
+    app: agent-relay
+  ports:
+    - port: 8000
+      targetPort: 8000
